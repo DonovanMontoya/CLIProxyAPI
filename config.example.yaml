@@ -1205,4 +1205,5 @@ plugins:
 #   quota-exceeded:
 #     switch-project: true
 #     switch-preview-model: true
+#     credential-probe-interval: 15m   # clear credential quota cooldowns at this interval to re-probe upstream (0 = off)
 # antigravity-credits moved to oauth.providers.antigravity.antigravity-credits.

@@ -346,6 +346,11 @@ type QuotaExceeded struct {
 	// When all free-tier auths are exhausted (429/503), the conductor retries with
 	// an auth that has available Google One AI credits.
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
+
+	// CredentialProbeInterval, when positive, clears credential-wide quota cooldowns at this interval
+	// so the next request probes upstream again (the provider re-applies the cooldown if still exhausted).
+	// Zero disables probing and cooldowns last until the provider-reported reset time.
+	CredentialProbeInterval time.Duration `yaml:"credential-probe-interval" json:"credential-probe-interval"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
