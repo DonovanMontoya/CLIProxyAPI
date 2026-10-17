@@ -120,6 +120,24 @@ func (e *modelCooldownError) Unwrap() error {
 	return e.cause
 }
 
+// usageLimited reports whether the cooldown comes from a configured usage
+// limit rather than an upstream quota error.
+func (e *modelCooldownError) usageLimited() bool {
+	var causeErr *Error
+	return errors.As(e.cause, &causeErr) && causeErr.Code == QuotaReserveErrorCode
+}
+
+// UsageLimitRefusalReset reports whether err refuses a request because the
+// credentials are held by a configured usage limit, and when the earliest of
+// them resumes.
+func UsageLimitRefusalReset(err error) (time.Time, bool) {
+	var cooldown *modelCooldownError
+	if !errors.As(err, &cooldown) || cooldown == nil || !cooldown.usageLimited() {
+		return time.Time{}, false
+	}
+	return time.Now().Add(cooldown.resetIn), true
+}
+
 func (e *modelCooldownError) Error() string {
 	modelName := e.model
 	if modelName == "" {
@@ -149,8 +167,7 @@ func (e *modelCooldownError) Error() string {
 	if e.provider != "" {
 		errorBody["provider"] = e.provider
 	}
-	var causeErr *Error
-	if errors.As(e.cause, &causeErr) && causeErr.Code == QuotaReserveErrorCode {
+	if e.usageLimited() {
 		// Mirror the upstream usage-limit shape so Codex clients stop (and pause
 		// goals) instead of retrying a credential the operator has reserved.
 		errorBody["type"] = "usage_limit_reached"

@@ -106,7 +106,7 @@ func TestCodexQuotaReserveHit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hit, ok := codexUsageLimitHit(QuotaState{Signals: tt.signals, ObservedAt: now}, usageLimitPolicy{ReservePercent: tt.reserve}, now)
+			hit, ok := usageLimitHitForQuota("codex", QuotaState{Signals: tt.signals, ObservedAt: now}, usageLimitPolicy{ReservePercent: tt.reserve}, now)
 			if ok != tt.wantHit {
 				t.Fatalf("hit = %v, want %v (%+v)", ok, tt.wantHit, hit)
 			}
@@ -139,8 +139,8 @@ func TestUsageLimitPolicyForAuth(t *testing.T) {
 	if got := usageLimitPolicyForAuth(optOut, cfg).ReservePercent; got != 0 {
 		t.Fatalf("opt-out reserve = %v, want 0", got)
 	}
-	if got := usageLimitPolicyForAuth(&Auth{Provider: "claude"}, cfg); got.enabled() {
-		t.Fatalf("non-codex reserve = %v, want 0", got)
+	if got := usageLimitPolicyForAuth(&Auth{Provider: "gemini"}, cfg); got.enabled() {
+		t.Fatalf("unsupported provider reserve = %v, want 0", got)
 	}
 }
 
@@ -380,7 +380,7 @@ func TestCodexDailyPacing(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hit, ok := codexUsageLimitHit(QuotaState{Signals: tt.signals, ObservedAt: now}, tt.policy, now)
+			hit, ok := usageLimitHitForQuota("codex", QuotaState{Signals: tt.signals, ObservedAt: now}, tt.policy, now)
 			if ok != tt.wantHit {
 				t.Fatalf("hit = %v, want %v (%+v)", ok, tt.wantHit, hit)
 			}
@@ -407,5 +407,94 @@ func TestUsageLimitPolicyDailyPacingOverride(t *testing.T) {
 	inherit := &Auth{Provider: "codex", Metadata: map[string]any{"quota_daily_pacing": nil, "quota_reserve_percent": nil}}
 	if policy := usageLimitPolicyForAuth(inherit, cfg); !policy.DailyPacing || policy.ReservePercent != 0 {
 		t.Fatalf("null overrides should inherit, got %+v", policy)
+	}
+}
+
+func TestClaudeUsageWindows(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fiveHourReset := now.Add(2 * time.Hour)
+	weeklyReset := now.Add(4 * 24 * time.Hour) // window opened 3 days ago, day 4 of 7
+	quota := QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization":    "0.90",
+		"Anthropic-Ratelimit-Unified-5h-Reset":          strconv.FormatInt(fiveHourReset.Unix(), 10),
+		"Anthropic-Ratelimit-Unified-7d-Utilization":    "0.70",
+		"Anthropic-Ratelimit-Unified-7d-Reset":          strconv.FormatInt(weeklyReset.Unix(), 10),
+		"Anthropic-Ratelimit-Unified-7d_oi-Utilization": "0.99",
+		"Anthropic-Ratelimit-Unified-7d_oi-Reset":       strconv.FormatInt(weeklyReset.Unix(), 10),
+	}}
+
+	windows := usageWindows("claude", quota)
+	if len(windows) != 2 || windows[0].minutes != 300 || windows[1].minutes != 10080 ||
+		windows[0].used != 90 || windows[1].used != 70 || !windows[1].resetAt.Equal(weeklyReset) {
+		t.Fatalf("claude windows = %+v", windows)
+	}
+
+	// 10% left in the session window trips an 11% reserve until the session resets.
+	hit, ok := usageLimitHitForQuota("claude", quota, usageLimitPolicy{ReservePercent: 11}, now)
+	if !ok || hit.kind != usageLimitReserve || !hit.resumeAt.Equal(fiveHourReset) {
+		t.Fatalf("reserve hit = %+v ok=%v", hit, ok)
+	}
+	// 70% of the week by day 4 is ahead of the 4/7 pace, so pacing holds until day 5.
+	hit, ok = usageLimitHitForQuota("claude", quota, usageLimitPolicy{DailyPacing: true}, now)
+	wantResume := weeklyReset.Add(-7 * 24 * time.Hour).Add(4 * 24 * time.Hour)
+	if !ok || hit.kind != usageLimitPace || !hit.resumeAt.Equal(wantResume) {
+		t.Fatalf("pace hit = %+v ok=%v, want resume %v", hit, ok, wantResume)
+	}
+	// The 7d_oi window is model-specific and never counts.
+	quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = "0.10"
+	quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = "0.10"
+	if hit, ok := usageLimitHitForQuota("claude", quota, usageLimitPolicy{ReservePercent: 11}, now); ok {
+		t.Fatalf("7d_oi tripped the reserve: %+v", hit)
+	}
+}
+
+func TestUsageLimitPolicyClaudeDefaultsAreIndependent(t *testing.T) {
+	cfg := &internalconfig.Config{}
+	cfg.QuotaExceeded.CodexReservePercent = 11
+	cfg.QuotaExceeded.ClaudeReservePercent = 20
+	cfg.QuotaExceeded.ClaudeDailyPacing = true
+	if got := usageLimitPolicyForAuth(&Auth{Provider: "codex"}, cfg); got.ReservePercent != 11 || got.DailyPacing {
+		t.Fatalf("codex policy = %+v", got)
+	}
+	if got := usageLimitPolicyForAuth(&Auth{Provider: "claude"}, cfg); got.ReservePercent != 20 || !got.DailyPacing {
+		t.Fatalf("claude policy = %+v", got)
+	}
+	override := &Auth{Provider: "claude", Metadata: map[string]any{"quota_reserve_percent": float64(5), "quota_daily_pacing": false}}
+	if got := usageLimitPolicyForAuth(override, cfg); got.ReservePercent != 5 || got.DailyPacing {
+		t.Fatalf("claude override policy = %+v", got)
+	}
+}
+
+func TestMarkResultAppliesClaudeUsageLimit(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	cfg := &internalconfig.Config{}
+	cfg.QuotaExceeded.ClaudeReservePercent = 11
+	manager.runtimeConfig.Store(cfg)
+	auth, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-reserve-auth", Provider: "claude"})
+	if errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+	resetAt := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	ctx := internallogging.WithResponseHeadersHolder(context.Background())
+	internallogging.SetResponseHeaders(ctx, http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.95"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":       []string{strconv.FormatInt(resetAt.Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": []string{"0.30"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":       []string{strconv.FormatInt(time.Now().Add(72*time.Hour).Unix(), 10)},
+	})
+	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: "claude", Model: "claude-sonnet-5-5", Success: true})
+
+	got, _ := manager.GetByID(auth.ID)
+	blocked, reason, next := isAuthBlockedForModel(got, "claude-sonnet-5-5", time.Now())
+	if !blocked || reason != blockReasonCooldown || !next.Equal(resetAt) {
+		t.Fatalf("blocked=%v reason=%v next=%v, want cooldown until %v", blocked, reason, next, resetAt)
+	}
+	_, errSelect := manager.availableAuthsForRouteModel([]*Auth{got}, "claude", "claude-sonnet-5-5", time.Now())
+	resume, limited := UsageLimitRefusalReset(errSelect)
+	if !limited || resume.Sub(resetAt) > 2*time.Second || resetAt.Sub(resume) > 2*time.Second {
+		t.Fatalf("UsageLimitRefusalReset = %v %v, want ~%v", resume, limited, resetAt)
+	}
+	if _, limited := UsageLimitRefusalReset(newModelCooldownError("m", "claude", time.Minute)); limited {
+		t.Fatal("plain cooldown reported as a usage limit")
 	}
 }
