@@ -784,6 +784,17 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		entry["request_retry"] = requestRetry
 	}
+	if reserve, ok := auth.QuotaReservePercentOverride(); ok {
+		entry["quota_reserve_percent"] = reserve
+	}
+	if pacing, ok := auth.QuotaDailyPacingOverride(); ok {
+		entry["quota_daily_pacing"] = pacing
+	}
+	if auth.LastError != nil && auth.LastError.Code == coreauth.QuotaReserveErrorCode &&
+		auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(time.Now()) {
+		entry["usage_limit_paused_until"] = auth.Quota.NextRecoverAt
+		entry["usage_limit_reason"] = auth.LastError.Message
+	}
 	return entry
 }
 

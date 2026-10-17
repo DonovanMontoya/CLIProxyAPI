@@ -1206,4 +1206,6 @@ plugins:
 #     switch-project: true
 #     switch-preview-model: true
 #     credential-probe-interval: 15m   # clear credential quota cooldowns at this interval to re-probe upstream (0 = off)
+#     codex-reserve-percent: 11        # stop using a Codex credential once any usage window has this % left (0 = off)
+#     codex-daily-pacing: false        # spread weekly Codex usage evenly across the week's days
 # antigravity-credits moved to oauth.providers.antigravity.antigravity-credits.

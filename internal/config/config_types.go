@@ -351,6 +351,18 @@ type QuotaExceeded struct {
 	// so the next request probes upstream again (the provider re-applies the cooldown if still exhausted).
 	// Zero disables probing and cooldowns last until the provider-reported reset time.
 	CredentialProbeInterval time.Duration `yaml:"credential-probe-interval" json:"credential-probe-interval"`
+
+	// CodexReservePercent, when positive, stops routing to a Codex credential once the remaining
+	// share of any reported usage window (5h or weekly) drops to this percentage, until that window
+	// resets. It keeps part of the subscription free for direct use. Credential metadata
+	// "quota_reserve_percent" overrides it per credential. Zero disables the reserve.
+	CodexReservePercent float64 `yaml:"codex-reserve-percent" json:"codex-reserve-percent"`
+
+	// CodexDailyPacing spreads multi-day Codex windows (weekly) evenly across their days: by the end
+	// of day d of 7 at most d/7 of the usable share (100 - CodexReservePercent) may be spent, with
+	// unused allowance carried over. Reaching the allowance pauses the credential until the next
+	// window day. Credential metadata "quota_daily_pacing" overrides it per credential.
+	CodexDailyPacing bool `yaml:"codex-daily-pacing" json:"codex-daily-pacing"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.

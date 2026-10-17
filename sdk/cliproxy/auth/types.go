@@ -558,6 +558,25 @@ func parseBoolAny(val any) (bool, bool) {
 	}
 }
 
+func parseFloatAny(val any) (float64, bool) {
+	switch typed := val.(type) {
+	case float64:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Float64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		parsed, ok := parseIntAny(val)
+		return float64(parsed), ok
+	}
+}
+
 func parseIntAny(val any) (int, bool) {
 	switch typed := val.(type) {
 	case int:

@@ -778,6 +778,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	reserveApplied := false
 	now := time.Now()
 
 	releaseMutation := m.lockAuthMutation(result.AuthID)
@@ -1038,6 +1039,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
 			}
 		}
+		reserveApplied = !wasTerminalUnauthorized && m.applyUsageLimitLocked(auth, now)
 
 		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
@@ -1050,13 +1052,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	releaseMutation()
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
-		if !result.CredentialScope && modelKey != "" {
+		// A reserve cooldown blocks the whole credential, so every shard must be refreshed.
+		credentialScope := result.CredentialScope || reserveApplied
+		if !credentialScope && modelKey != "" {
 			targetModels = append(targetModels, modelKey)
 			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
 				targetModels = append(targetModels, routeKey)
 			}
 		}
-		m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope)
+		m.scheduler.upsertAuthResult(authSnapshot, targetModels, credentialScope)
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
