@@ -363,6 +363,13 @@ type QuotaExceeded struct {
 	// unused allowance carried over. Reaching the allowance pauses the credential until the next
 	// window day. Credential metadata "quota_daily_pacing" overrides it per credential.
 	CodexDailyPacing bool `yaml:"codex-daily-pacing" json:"codex-daily-pacing"`
+
+	// ClaudeReservePercent is CodexReservePercent for Claude credentials, applied to the 5h session and
+	// weekly windows reported in Anthropic's unified rate-limit headers.
+	ClaudeReservePercent float64 `yaml:"claude-reserve-percent" json:"claude-reserve-percent"`
+
+	// ClaudeDailyPacing is CodexDailyPacing for the Claude weekly window.
+	ClaudeDailyPacing bool `yaml:"claude-daily-pacing" json:"claude-daily-pacing"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.

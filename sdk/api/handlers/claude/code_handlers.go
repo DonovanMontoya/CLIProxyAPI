@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -367,6 +368,13 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 	if clienterror.IsClaudeThreadNotFound(status, errors.New(errText)) {
 		response.Error.Details = &claudeErrorDetails{ErrorCode: "thread_not_found"}
 	}
+	if msg != nil {
+		if _, limited := coreauth.UsageLimitRefusalReset(msg.Error); limited {
+			// The cooldown body names the Codex usage-limit type; Claude clients
+			// only understand Anthropic error types.
+			response.Error.Type = "rate_limit_error"
+		}
+	}
 	return response
 }
 
@@ -405,6 +413,13 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if msg != nil && msg.Error != nil {
 		for _, value := range coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After") {
 			c.Writer.Header().Add("Retry-After", value)
+		}
+		if resetAt, limited := coreauth.UsageLimitRefusalReset(msg.Error); limited {
+			// Report the hold the way Anthropic reports an exhausted subscription
+			// so Claude clients show when it lifts and stop retrying until then.
+			c.Writer.Header().Set("X-Should-Retry", "false")
+			c.Writer.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			c.Writer.Header().Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(resetAt.Unix(), 10))
 		}
 	}
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {

@@ -80,16 +80,22 @@ func (p usageLimitPolicy) enabled() bool {
 }
 
 // usageLimitPolicyForAuth returns the usage limit that applies to auth. Only
-// Codex reports the usage windows the limits rely on, so other providers get
-// no limit. Credential metadata overrides the global configuration.
+// Codex and Claude report the usage windows the limits rely on, so other
+// providers get no limit. Credential metadata overrides the provider default.
 func usageLimitPolicyForAuth(auth *Auth, cfg *internalconfig.Config) usageLimitPolicy {
 	var policy usageLimitPolicy
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+	provider := usageLimitProvider(auth)
+	if provider == "" {
 		return policy
 	}
 	if cfg != nil {
-		policy.ReservePercent = cfg.QuotaExceeded.CodexReservePercent
-		policy.DailyPacing = cfg.QuotaExceeded.CodexDailyPacing
+		if provider == "codex" {
+			policy.ReservePercent = cfg.QuotaExceeded.CodexReservePercent
+			policy.DailyPacing = cfg.QuotaExceeded.CodexDailyPacing
+		} else {
+			policy.ReservePercent = cfg.QuotaExceeded.ClaudeReservePercent
+			policy.DailyPacing = cfg.QuotaExceeded.ClaudeDailyPacing
+		}
 	}
 	if override, ok := auth.QuotaReservePercentOverride(); ok {
 		policy.ReservePercent = override
@@ -101,11 +107,73 @@ func usageLimitPolicyForAuth(auth *Auth, cfg *internalconfig.Config) usageLimitP
 	return policy
 }
 
-// codexUsageLimitHit reports whether any of the credential's main Codex
-// usage windows has hit the policy. Plans differ in which windows they report
-// (some have no 5h window), so every window present in the snapshot is checked.
-// Windows whose reset time has passed are stale and ignored. When several
-// windows trip, the one that keeps the credential paused longest wins.
+// usageLimitProvider returns the normalized provider of auth when it supports
+// usage limits, or "" otherwise.
+func usageLimitProvider(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	switch provider := strings.ToLower(strings.TrimSpace(auth.Provider)); provider {
+	case "codex", "claude":
+		return provider
+	default:
+		return ""
+	}
+}
+
+// claudeUsageWindowHeaders names the Anthropic unified rate-limit headers of
+// the credential-wide Claude windows.
+var claudeUsageWindowHeaders = []struct {
+	utilization, reset string
+	minutes            int
+}{
+	{"Anthropic-Ratelimit-Unified-5h-Utilization", "Anthropic-Ratelimit-Unified-5h-Reset", 5 * 60},
+	{"Anthropic-Ratelimit-Unified-7d-Utilization", "Anthropic-Ratelimit-Unified-7d-Reset", 7 * 24 * 60},
+}
+
+// usageWindow is one provider usage window read from the quota snapshot.
+type usageWindow struct {
+	used    float64 // percent of the window spent, 0-100
+	minutes int
+	resetAt time.Time
+}
+
+// usageWindows reads the credential-wide usage windows a provider (as returned
+// by usageLimitProvider) reports.
+// Codex plans differ in which windows they report (some have no 5h window),
+// so every slot present is used. Claude always reports a 5h session window and
+// a weekly window; its model-specific and overage windows do not block the
+// whole credential and are ignored.
+func usageWindows(provider string, quota QuotaState) []usageWindow {
+	windows := make([]usageWindow, 0, 2)
+	switch provider {
+	case "codex":
+		for _, slot := range []string{"Primary", "Secondary"} {
+			prefix := "X-Codex-" + slot + "-"
+			used, err := strconv.ParseFloat(quota.Signals[prefix+"Used-Percent"], 64)
+			if err != nil {
+				continue
+			}
+			minutes, _ := strconv.Atoi(quota.Signals[prefix+"Window-Minutes"])
+			windows = append(windows, usageWindow{used: used, minutes: minutes, resetAt: codexWindowResetAt(quota.Signals, prefix, quota.ObservedAt)})
+		}
+	case "claude":
+		for _, w := range claudeUsageWindowHeaders {
+			utilization, err := strconv.ParseFloat(quota.Signals[w.utilization], 64)
+			if err != nil {
+				continue
+			}
+			resetAt, _ := parseTimeValue(quota.Signals[w.reset])
+			windows = append(windows, usageWindow{used: utilization * 100, minutes: w.minutes, resetAt: resetAt})
+		}
+	}
+	return windows
+}
+
+// usageLimitHitForQuota reports whether any of the provider's usage windows
+// has hit the policy. Windows whose reset time has passed are stale and
+// ignored. When several windows trip, the one that keeps the credential paused
+// longest wins.
 //
 // The reserve trips once the remaining share drops to ReservePercent, and holds
 // until the window resets. Daily pacing applies to windows spanning several
@@ -113,7 +181,7 @@ func usageLimitPolicyForAuth(auth *Auth, cfg *internalconfig.Config) usageLimitP
 // window's days, counted from the window start. Unused allowance carries over,
 // so by the end of day d of 7 at most d/7 of the usable share may be spent.
 // Reaching the allowance pauses the credential until the next day begins.
-func codexUsageLimitHit(quota QuotaState, policy usageLimitPolicy, now time.Time) (usageLimitHit, bool) {
+func usageLimitHitForQuota(provider string, quota QuotaState, policy usageLimitPolicy, now time.Time) (usageLimitHit, bool) {
 	var hit usageLimitHit
 	if !policy.enabled() || len(quota.Signals) == 0 {
 		return hit, false
@@ -126,40 +194,33 @@ func codexUsageLimitHit(quota QuotaState, policy usageLimitPolicy, now time.Time
 		hit = candidate
 		found = true
 	}
-	for _, slot := range []string{"Primary", "Secondary"} {
-		prefix := "X-Codex-" + slot + "-"
-		used, err := strconv.ParseFloat(quota.Signals[prefix+"Used-Percent"], 64)
-		if err != nil {
+	for _, w := range usageWindows(provider, quota) {
+		if !w.resetAt.After(now) {
 			continue
 		}
-		resetAt := codexWindowResetAt(quota.Signals, prefix, quota.ObservedAt)
-		if !resetAt.After(now) {
-			continue
-		}
-		minutes, _ := strconv.Atoi(quota.Signals[prefix+"Window-Minutes"])
-		base := usageLimitHit{used: used, reservePercent: policy.ReservePercent, windowMinutes: minutes, resetAt: resetAt}
+		base := usageLimitHit{used: w.used, reservePercent: policy.ReservePercent, windowMinutes: w.minutes, resetAt: w.resetAt}
 
-		if policy.ReservePercent > 0 && 100-used <= policy.ReservePercent {
+		if policy.ReservePercent > 0 && 100-w.used <= policy.ReservePercent {
 			reserveHit := base
 			reserveHit.kind = usageLimitReserve
 			reserveHit.allowedUsed = 100 - policy.ReservePercent
-			reserveHit.resumeAt = resetAt
+			reserveHit.resumeAt = w.resetAt
 			consider(reserveHit)
 		}
 
-		window := time.Duration(minutes) * time.Minute
+		window := time.Duration(w.minutes) * time.Minute
 		if !policy.DailyPacing || window < 2*24*time.Hour {
 			continue
 		}
 		days := window.Hours() / 24
-		windowStart := resetAt.Add(-window)
+		windowStart := w.resetAt.Add(-window)
 		elapsed := now.Sub(windowStart)
 		if elapsed < 0 {
 			continue
 		}
 		day := int(elapsed / (24 * time.Hour))
 		allowed := (100 - policy.ReservePercent) * math.Min(1, float64(day+1)/days)
-		if used < allowed {
+		if w.used < allowed {
 			continue
 		}
 		paceHit := base
@@ -168,8 +229,8 @@ func codexUsageLimitHit(quota QuotaState, policy usageLimitPolicy, now time.Time
 		paceHit.day = day + 1
 		paceHit.days = int(math.Ceil(days))
 		paceHit.resumeAt = windowStart.Add(time.Duration(day+1) * 24 * time.Hour)
-		if paceHit.resumeAt.After(resetAt) {
-			paceHit.resumeAt = resetAt
+		if paceHit.resumeAt.After(w.resetAt) {
+			paceHit.resumeAt = w.resetAt
 		}
 		consider(paceHit)
 	}
@@ -214,7 +275,7 @@ func usageLimitHitForAuth(auth *Auth, cfg *internalconfig.Config, now time.Time)
 	if auth == nil || (cfg != nil && cfg.Home.Enabled) {
 		return usageLimitHit{}, false
 	}
-	return codexUsageLimitHit(auth.Quota, usageLimitPolicyForAuth(auth, cfg), now)
+	return usageLimitHitForQuota(usageLimitProvider(auth), auth.Quota, usageLimitPolicyForAuth(auth, cfg), now)
 }
 
 // applyUsageLimitLocked puts auth into a credential-wide quota cooldown until
