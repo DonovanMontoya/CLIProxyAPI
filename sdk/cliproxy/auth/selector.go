@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -147,6 +148,14 @@ func (e *modelCooldownError) Error() string {
 	}
 	if e.provider != "" {
 		errorBody["provider"] = e.provider
+	}
+	var causeErr *Error
+	if errors.As(e.cause, &causeErr) && causeErr.Code == QuotaReserveErrorCode {
+		// Mirror the upstream usage-limit shape so Codex clients stop (and pause
+		// goals) instead of retrying a credential the operator has reserved.
+		errorBody["type"] = "usage_limit_reached"
+		errorBody["resets_in_seconds"] = resetSeconds
+		errorBody["resets_at"] = time.Now().Add(e.resetIn).Unix()
 	}
 	if e.cause != nil {
 		if causeText := ExtractUpstreamErrorSummary(e.cause.Error()); causeText != "" {

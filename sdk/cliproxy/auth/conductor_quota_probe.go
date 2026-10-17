@@ -45,6 +45,11 @@ func (m *Manager) probeQuotaCooldowns(ctx context.Context, now time.Time, lastPr
 	m.mu.RLock()
 	for id, auth := range m.auths {
 		if auth != nil && auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+			// A reserve cooldown comes from the observed usage, not from a past 429, so
+			// probing would only spend reserved usage to learn what is already known.
+			if _, held := usageLimitHitForAuth(auth, cfg, now); held {
+				continue
+			}
 			cooling[id] = struct{}{}
 		}
 	}
