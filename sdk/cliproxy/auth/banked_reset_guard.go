@@ -16,9 +16,10 @@ type bankedResetAttempt struct {
 
 // BeginBankedReset reserves one account-wide reset attempt. Both automatic and
 // dashboard resets must reserve before sending a mutation. The returned function
-// releases only the in-flight flag; errors and cancellations retain the gate.
+// takes whether dispatch may have occurred. Pass false only for a definite local
+// rejection before dispatch; uncertain errors and cancellations must pass true.
 // Account IDs must identify the provider account, never a local credential file.
-func (m *Manager) BeginBankedReset(provider, accountID string, now, expiresAt time.Time) (func(), error) {
+func (m *Manager) BeginBankedReset(provider, accountID string, now, expiresAt time.Time) (func(bool), error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	accountID = strings.TrimSpace(accountID)
 	if m == nil || accountID == "" || (provider != "codex" && provider != "claude") {
@@ -56,9 +57,18 @@ func (m *Manager) BeginBankedReset(provider, accountID string, now, expiresAt ti
 	started := time.Now()
 	attempt := &bankedResetAttempt{inFlight: true, blockedUntil: until}
 	m.bankedResetAttempts[key] = attempt
-	return func() {
+	completed := false
+	return func(attempted bool) {
 		m.bankedResetMu.Lock()
 		defer m.bankedResetMu.Unlock()
+		if completed {
+			return
+		}
+		completed = true
+		if !attempted {
+			delete(m.bankedResetAttempts, key)
+			return
+		}
 		attempt.inFlight = false
 		// A long upstream call must also protect clicks just after completion.
 		attempt.blockedUntil = maxResetTime(attempt.blockedUntil, now.Add(time.Since(started)+window))

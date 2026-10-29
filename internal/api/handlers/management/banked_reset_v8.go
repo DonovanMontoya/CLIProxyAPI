@@ -65,7 +65,12 @@ func (h *Handler) APICallV8(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	defer finish()
+	defer func() {
+		// APICall returns 400 only for local validation failures, before Do.
+		// Upstream responses (including upstream 400) are wrapped in HTTP 200;
+		// transport/read failures use 502 and must retain the reservation.
+		finish(c.Writer.Status() != http.StatusBadRequest)
+	}()
 	h.APICall(c)
 }
 

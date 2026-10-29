@@ -26,7 +26,7 @@ func TestBankedResetGuardConcurrentAccountAttempts(t *testing.T) {
 			finish, err := manager.BeginBankedReset("codex", "same-account", now, now.Add(4*time.Minute))
 			if err == nil {
 				winners.Add(1)
-				finish()
+				finish(true)
 			}
 		}()
 	}
@@ -40,7 +40,7 @@ func TestBankedResetGuardConcurrentAccountAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	finish()
+	finish(true)
 }
 
 func TestBankedResetGuardRetainsInFlightBeyondGate(t *testing.T) {
@@ -53,7 +53,7 @@ func TestBankedResetGuardRetainsInFlightBeyondGate(t *testing.T) {
 	if _, err = manager.BeginBankedReset("claude", "org", now.Add(time.Hour), time.Time{}); err == nil {
 		t.Fatal("allowed a second reset while the first request was still in flight")
 	}
-	finish()
+	finish(true)
 	if _, err = manager.BeginBankedReset("claude", "org", now.Add(time.Minute), time.Time{}); err == nil {
 		t.Fatal("allowed a duplicate after completion")
 	}
@@ -61,7 +61,7 @@ func TestBankedResetGuardRetainsInFlightBeyondGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new gate rejected: %v", err)
 	}
-	finish()
+	finish(true)
 }
 
 func TestBankedResetGuardRequiresAccountIdentity(t *testing.T) {
