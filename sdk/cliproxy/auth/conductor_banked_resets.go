@@ -146,8 +146,7 @@ func bankedResetEligible(auth *Auth) bool {
 }
 
 // useExpiringCodexResetCredit consumes one Codex reset credit when the earliest
-// available credit expires within lead. Codex only spends a credit when it
-// actually refreshes a usage window, so consuming early is never wasteful.
+// available credit expires within lead.
 // It returns the earliest expiry still pending so the caller re-checks in time.
 func (m *Manager) useExpiringCodexResetCredit(ctx context.Context, auth *Auth, now time.Time, lead time.Duration) (time.Time, error) {
 	headers := codexResetHeaders(auth)
@@ -160,6 +159,12 @@ func (m *Manager) useExpiringCodexResetCredit(ctx context.Context, auth *Auth, n
 		return earliest, nil
 	}
 
+	accountID, _ := auth.Metadata["account_id"].(string)
+	finish, err := m.BeginBankedReset("codex", accountID, now, earliest)
+	if err != nil {
+		return earliest, err
+	}
+	defer finish()
 	payload, _ := json.Marshal(map[string]string{"redeem_request_id": uuid.NewString()})
 	if _, err = m.bankedResetRequest(ctx, auth, http.MethodPost, codexResetCreditsConsumeURL, payload, headers); err != nil {
 		return earliest, fmt.Errorf("consume codex reset credit: %w", err)
@@ -237,6 +242,11 @@ func (m *Manager) useExpiringClaudeResetGrant(ctx context.Context, auth *Auth, n
 	if err != nil {
 		return grant.endsAt, err
 	}
+	finish, err := m.BeginBankedReset("claude", organization, now, grant.endsAt)
+	if err != nil {
+		return grant.endsAt, err
+	}
+	defer finish()
 	payload, _ := json.Marshal(map[string]string{
 		"program":    claudeResetGrantProgram,
 		"grant_id":   grant.id,
