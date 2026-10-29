@@ -1210,4 +1210,5 @@ plugins:
 #     codex-daily-pacing: false        # spread weekly Codex usage evenly across the week's days
 #     claude-reserve-percent: 0        # same as codex-reserve-percent, for Claude session and weekly windows
 #     claude-daily-pacing: false       # same as codex-daily-pacing, for the Claude weekly window
+#     banked-reset-auto-use-before: 5m #  spend a banked Codex/Claude usage reset this long before it expires (0 = off)
 # antigravity-credits moved to oauth.providers.antigravity.antigravity-credits.
