@@ -370,6 +370,11 @@ type QuotaExceeded struct {
 
 	// ClaudeDailyPacing is CodexDailyPacing for the Claude weekly window.
 	ClaudeDailyPacing bool `yaml:"claude-daily-pacing" json:"claude-daily-pacing"`
+
+	// BankedResetAutoUseBefore, when positive, spends a banked usage reset (Codex rate-limit reset
+	// credits, Claude reset grants) once it is this close to expiring, so it is not lost unused.
+	// Zero disables automatic use.
+	BankedResetAutoUseBefore time.Duration `yaml:"banked-reset-auto-use-before" json:"banked-reset-auto-use-before"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
