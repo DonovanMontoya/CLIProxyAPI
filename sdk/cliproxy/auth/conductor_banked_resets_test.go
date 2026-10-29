@@ -168,8 +168,44 @@ func TestEarliestClaudeResetGrantSkipsUnusable(t *testing.T) {
 		{"id":"empty","resets_left":0,"usable_now":true,"ends_at":%[1]q},
 		{"id":"never","resets_left":1,"usable_now":true},
 		{"id":"ok","resets_left":1,"usable_now":true,"use_requires_limit":false,"ends_at":%[1]q}]}`, ends)
-	grant, ok := earliestClaudeResetGrant(gjson.Parse(block), now)
-	if !ok || grant.id != "ok" || grant.useRequiresLimit {
-		t.Fatalf("got %+v ok=%v, want grant ok without limit requirement", grant, ok)
+	grant, _, ok := earliestClaudeResetGrant(gjson.Parse(block), now, true)
+	if !ok || grant.id != "ok" {
+		t.Fatalf("got %+v ok=%v, want grant ok", grant, ok)
+	}
+}
+
+func TestEarliestClaudeResetGrantSkipsLimitGatedWhenNotAtLimit(t *testing.T) {
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	gatedEnds := now.Add(time.Minute)
+	block := fmt.Sprintf(`{"grants":[
+		{"id":"gated","resets_left":1,"usable_now":true,"use_requires_limit":true,"ends_at":%q},
+		{"id":"free","resets_left":1,"usable_now":true,"use_requires_limit":false,"ends_at":%q}]}`,
+		gatedEnds.Format(time.RFC3339), now.Add(2*time.Minute).Format(time.RFC3339))
+	grant, earliest, ok := earliestClaudeResetGrant(gjson.Parse(block), now, false)
+	if !ok || grant.id != "free" {
+		t.Fatalf("got %+v ok=%v, want the ungated grant", grant, ok)
+	}
+	if !earliest.Equal(gatedEnds) {
+		t.Fatalf("earliest = %s, want gated grant expiry %s", earliest, gatedEnds)
+	}
+}
+
+func TestManager_BankedResetRetriesAfterFailedConsume(t *testing.T) {
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	exec := &bankedResetExecutor{provider: "codex", routes: map[string]string{
+		"GET " + codexResetCreditsURL: fmt.Sprintf(`{"credits":[{"id":"c1","reset_type":"codex_rate_limits","status":"available","expires_at":%q}]}`,
+			now.Add(3*time.Minute).Format(time.RFC3339)),
+	}}
+	manager := newBankedResetManager(t, exec, &Auth{ID: "codex-auth", Provider: "codex"}, 5*time.Minute)
+
+	states := make(map[string]*bankedResetState)
+	// The consume route is missing, so the first attempt fails.
+	manager.useExpiringBankedResets(context.Background(), now, states)
+	exec.mu.Lock()
+	exec.routes["POST "+codexResetCreditsConsumeURL] = `{}`
+	exec.mu.Unlock()
+	manager.useExpiringBankedResets(context.Background(), now.Add(time.Minute), states)
+	if got := exec.count("POST " + codexResetCreditsConsumeURL); got != 2 {
+		t.Fatalf("consume attempts = %d, want a retry on the next tick", got)
 	}
 }

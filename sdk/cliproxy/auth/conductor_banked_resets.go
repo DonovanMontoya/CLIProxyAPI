@@ -19,6 +19,7 @@ import (
 const (
 	bankedResetTickInterval   = time.Minute
 	bankedResetStatusInterval = time.Hour
+	bankedResetRetryInterval  = 5 * time.Minute
 	bankedResetMaxBody        = 1 << 20
 
 	codexResetCreditsURL        = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
@@ -36,11 +37,11 @@ var (
 	claudeOrganizationPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
-// bankedResetState caches when an auth's banked resets were last read and the
-// earliest expiry seen, so upstream is only polled hourly until a reset nears expiry.
+// bankedResetState caches when an auth's banked resets should next be read and
+// the earliest expiry seen, so upstream is only polled hourly until a reset nears expiry.
 type bankedResetState struct {
-	checkedAt time.Time
-	expiresAt time.Time
+	nextCheckAt time.Time
+	expiresAt   time.Time
 }
 
 // runBankedResetLoop spends banked usage resets (Codex rate-limit reset credits
@@ -99,7 +100,6 @@ func (m *Manager) useExpiringBankedResets(ctx context.Context, now time.Time, st
 			state = &bankedResetState{}
 			states[auth.ID] = state
 		}
-		state.checkedAt = now
 		var (
 			expiresAt time.Time
 			err       error
@@ -112,9 +112,16 @@ func (m *Manager) useExpiringBankedResets(ctx context.Context, now time.Time, st
 		}
 		if err != nil {
 			log.Warnf("banked reset: auth %s: %v", auth.ID, err)
+			// Keep a known expiry so a near-expiry reset is retried every tick,
+			// and re-read the status sooner than a successful check would.
+			if !expiresAt.IsZero() {
+				state.expiresAt = expiresAt
+			}
+			state.nextCheckAt = now.Add(bankedResetRetryInterval)
 			continue
 		}
 		state.expiresAt = expiresAt
+		state.nextCheckAt = now.Add(bankedResetStatusInterval)
 	}
 }
 
@@ -123,7 +130,7 @@ func (s *bankedResetState) due(now time.Time, lead time.Duration) bool {
 	if !s.expiresAt.IsZero() && s.expiresAt.Sub(now) <= lead {
 		return true
 	}
-	return s.checkedAt.IsZero() || now.Sub(s.checkedAt) >= bankedResetStatusInterval
+	return !now.Before(s.nextCheckAt)
 }
 
 func bankedResetEligible(auth *Auth) bool {
@@ -198,14 +205,13 @@ func earliestCodexResetCreditExpiry(body []byte, now time.Time) time.Time {
 
 // claudeResetGrant is a spendable grant from the cedar_ember usage block.
 type claudeResetGrant struct {
-	id               string
-	endsAt           time.Time
-	useRequiresLimit bool
+	id     string
+	endsAt time.Time
 }
 
-// useExpiringClaudeResetGrant claims the earliest-expiring Claude reset grant
-// once it expires within lead. Grants that require the account to be at its
-// limit cannot be claimed otherwise and are left to expire.
+// useExpiringClaudeResetGrant claims the earliest-expiring claimable Claude reset
+// grant once it expires within lead. Grants that require the account to be at
+// its limit cannot be claimed otherwise and are left to expire.
 func (m *Manager) useExpiringClaudeResetGrant(ctx context.Context, auth *Auth, now time.Time, lead time.Duration) (time.Time, error) {
 	headers := claudeResetHeaders()
 	body, err := m.bankedResetRequest(ctx, auth, http.MethodGet, claudeResetGrantStatusURL, nil, headers)
@@ -216,17 +222,15 @@ func (m *Manager) useExpiringClaudeResetGrant(ctx context.Context, auth *Auth, n
 	if !block.Get("eligible").Bool() {
 		return time.Time{}, nil
 	}
-	grant, ok := earliestClaudeResetGrant(block, now)
+	grant, earliest, ok := earliestClaudeResetGrant(block, now, block.Get("at_limit").Bool())
 	if !ok || grant.endsAt.Sub(now) > lead {
-		return grant.endsAt, nil
+		// earliest also covers grants that need the account at its limit, so
+		// they are re-checked near expiry in case the account reaches it.
+		return earliest, nil
 	}
 	if cooldown := parseBankedResetTime(block.Get("cooldown_until")); cooldown.After(now) {
 		log.Debugf("banked reset: Claude reset grants for auth %s are cooling down until %s", auth.ID, cooldown.Format(time.RFC3339))
-		return grant.endsAt, nil
-	}
-	if grant.useRequiresLimit && !block.Get("at_limit").Bool() {
-		log.Debugf("banked reset: Claude reset grant %s for auth %s needs the account at its limit; not claimable yet", grant.id, auth.ID)
-		return grant.endsAt, nil
+		return earliest, nil
 	}
 
 	organization, err := m.claudeOrganizationUUID(ctx, auth, headers)
@@ -262,11 +266,15 @@ func claudeResetHeaders() http.Header {
 	return headers
 }
 
-// earliestClaudeResetGrant picks the claimable grant that expires first. Grants
-// without an end time never expire and are ignored.
-func earliestClaudeResetGrant(block gjson.Result, now time.Time) (claudeResetGrant, bool) {
-	var best claudeResetGrant
-	found := false
+// earliestClaudeResetGrant picks the claimable grant that expires first, plus the
+// earliest expiry among all usable grants including those gated on atLimit.
+// Grants without an end time never expire and are ignored.
+func earliestClaudeResetGrant(block gjson.Result, now time.Time, atLimit bool) (claudeResetGrant, time.Time, bool) {
+	var (
+		best     claudeResetGrant
+		earliest time.Time
+		found    bool
+	)
 	block.Get("grants").ForEach(func(_, raw gjson.Result) bool {
 		id := raw.Get("id").String()
 		if !claudeResetGrantIDPattern.MatchString(id) || raw.Get("paused").Bool() ||
@@ -280,20 +288,22 @@ func earliestClaudeResetGrant(block gjson.Result, now time.Time) (claudeResetGra
 		if endsAt.IsZero() || !endsAt.After(now) {
 			return true
 		}
+		if earliest.IsZero() || endsAt.Before(earliest) {
+			earliest = endsAt
+		}
+		// A grant that does not say otherwise is treated as needing the limit.
+		requiresLimit := raw.Get("use_requires_limit")
+		if !atLimit && (requiresLimit.Type == gjson.Null || requiresLimit.Bool()) {
+			return true
+		}
 		if found && !endsAt.Before(best.endsAt) {
 			return true
 		}
-		requiresLimit := raw.Get("use_requires_limit")
-		best = claudeResetGrant{
-			id:     id,
-			endsAt: endsAt,
-			// A grant that does not say otherwise is treated as needing the limit.
-			useRequiresLimit: requiresLimit.Type == gjson.Null || requiresLimit.Bool(),
-		}
+		best = claudeResetGrant{id: id, endsAt: endsAt}
 		found = true
 		return true
 	})
-	return best, found
+	return best, earliest, found
 }
 
 func (m *Manager) claudeOrganizationUUID(ctx context.Context, auth *Auth, headers http.Header) (string, error) {
