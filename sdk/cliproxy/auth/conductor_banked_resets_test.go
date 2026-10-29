@@ -22,6 +22,7 @@ type bankedResetExecutor struct {
 	mu       sync.Mutex
 	routes   map[string]string
 	calls    []string
+	respond  func(*http.Request) (*http.Response, error)
 }
 
 func (e *bankedResetExecutor) Identifier() string { return e.provider }
@@ -44,7 +45,11 @@ func (e *bankedResetExecutor) HttpRequest(_ context.Context, _ *Auth, req *http.
 	e.mu.Lock()
 	e.calls = append(e.calls, key)
 	body, ok := e.routes[key]
+	respond := e.respond
 	e.mu.Unlock()
+	if respond != nil {
+		return respond(req)
+	}
 	if !ok {
 		return nil, fmt.Errorf("unexpected request %s", key)
 	}
@@ -190,13 +195,13 @@ func TestEarliestClaudeResetGrantSkipsLimitGatedWhenNotAtLimit(t *testing.T) {
 	}
 }
 
-func TestManager_BankedResetRetriesAfterFailedConsume(t *testing.T) {
+func TestManager_BankedResetDoesNotRetryAmbiguousConsume(t *testing.T) {
 	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
 	exec := &bankedResetExecutor{provider: "codex", routes: map[string]string{
 		"GET " + codexResetCreditsURL: fmt.Sprintf(`{"credits":[{"id":"c1","reset_type":"codex_rate_limits","status":"available","expires_at":%q}]}`,
 			now.Add(3*time.Minute).Format(time.RFC3339)),
 	}}
-	manager := newBankedResetManager(t, exec, &Auth{ID: "codex-auth", Provider: "codex"}, 5*time.Minute)
+	manager := newBankedResetManager(t, exec, &Auth{ID: "codex-auth", Provider: "codex", Metadata: map[string]any{"account_id": "acct"}}, 5*time.Minute)
 
 	states := make(map[string]*bankedResetState)
 	// The consume route is missing, so the first attempt fails.
@@ -205,7 +210,7 @@ func TestManager_BankedResetRetriesAfterFailedConsume(t *testing.T) {
 	exec.routes["POST "+codexResetCreditsConsumeURL] = `{}`
 	exec.mu.Unlock()
 	manager.useExpiringBankedResets(context.Background(), now.Add(time.Minute), states)
-	if got := exec.count("POST " + codexResetCreditsConsumeURL); got != 2 {
-		t.Fatalf("consume attempts = %d, want a retry on the next tick", got)
+	if got := exec.count("POST " + codexResetCreditsConsumeURL); got != 1 {
+		t.Fatalf("consume attempts = %d, want no retry after an uncertain outcome", got)
 	}
 }

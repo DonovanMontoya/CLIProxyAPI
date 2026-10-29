@@ -235,6 +235,10 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+	// bankedResetMu protects account-wide reset reservations across loop restarts
+	// and dashboard requests, including duplicate credentials for one account.
+	bankedResetMu       sync.Mutex
+	bankedResetAttempts map[string]*bankedResetAttempt
 	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
 	persistLocks sync.Map
 	// authMutationLocks coordinate credential mutations without blocking unrelated readers.
