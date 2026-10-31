@@ -14,8 +14,9 @@ type UsageWindowReport struct {
 	Window           string  `json:"window"`
 	UsedPercent      float64 `json:"used_percent"`
 	RemainingPercent float64 `json:"remaining_percent"`
-	// ResetsAt is when the window resets. It is omitted once the observed
-	// reset time has passed, in which case the window counts as unused.
+	// ResetsAt is when the window resets. It is omitted when upstream sent no
+	// reset time, and once the observed reset time has passed, in which case
+	// the window counts as unused.
 	ResetsAt   *time.Time `json:"resets_at,omitempty"`
 	ObservedAt time.Time  `json:"observed_at"`
 }
@@ -54,10 +55,12 @@ func (m *Manager) UsageReport(now time.Time) []UsageProviderReport {
 		credential := make([]UsageWindowReport, 0, len(windows))
 		for _, w := range windows {
 			entry := UsageWindowReport{Window: usageWindowName(w.minutes), ObservedAt: auth.Quota.ObservedAt}
+			if w.resetAt.IsZero() || w.resetAt.After(now) {
+				entry.UsedPercent = math.Max(0, math.Min(100, w.used))
+			}
 			if w.resetAt.After(now) {
 				resetAt := w.resetAt
 				entry.ResetsAt = &resetAt
-				entry.UsedPercent = math.Max(0, math.Min(100, w.used))
 			}
 			entry.RemainingPercent = 100 - entry.UsedPercent
 			credential = append(credential, entry)

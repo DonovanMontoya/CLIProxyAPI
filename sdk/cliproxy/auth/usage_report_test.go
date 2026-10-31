@@ -47,6 +47,12 @@ func TestUsageReportCoversCodexAndClaude(t *testing.T) {
 		"X-Codex-Primary-Reset-At":       unix(sessionReset),
 	}}})
 	register(&Auth{ID: "gemini-a", Provider: "gemini"})
+	// Some Claude responses carry utilization without reset headers; the
+	// observed utilization still counts.
+	register(&Auth{ID: "claude-b", Provider: "claude", Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.22",
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.9",
+	}}})
 
 	reports := manager.UsageReport(now)
 	if len(reports) != 2 || reports[0].Provider != "claude" || reports[1].Provider != "codex" {
@@ -54,11 +60,12 @@ func TestUsageReportCoversCodexAndClaude(t *testing.T) {
 	}
 
 	claude := reports[0]
-	if len(claude.PerCredential) != 1 || len(claude.Windows) != 2 {
+	if len(claude.PerCredential) != 2 || len(claude.Windows) != 2 {
 		t.Fatalf("claude report = %+v", claude)
 	}
-	assertUsageWindow(t, claude.Windows[0], "5h", 42, &sessionReset)
-	assertUsageWindow(t, claude.Windows[1], "7d", 70, &weeklyReset)
+	assertUsageWindow(t, claude.Windows[0], "5h", 32, &sessionReset)
+	assertUsageWindow(t, claude.Windows[1], "7d", 80, &weeklyReset)
+	assertUsageWindow(t, claude.PerCredential[1][0], "5h", 22, nil)
 
 	codex := reports[1]
 	if len(codex.PerCredential) != 2 || len(codex.Windows) != 2 {
