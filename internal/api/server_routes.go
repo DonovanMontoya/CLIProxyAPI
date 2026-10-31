@@ -71,6 +71,7 @@ func (s *Server) setupRoutes() {
 			c.Set(handlers.ModelDetailIDContextKey, strings.TrimPrefix(c.Param("model"), "/"))
 			s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers)(c)
 		})
+		v1.GET("/usage", s.usageReportHandler)
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
@@ -1349,4 +1350,16 @@ func homeModelInt64Value(model map[string]any, keys ...string) int64 {
 		}
 	}
 	return 0
+}
+
+// usageReportHandler returns the Codex and Claude usage windows the proxy last
+// observed, so API clients can see how much subscription usage is left without
+// management access.
+func (s *Server) usageReportHandler(c *gin.Context) {
+	now := time.Now()
+	providers := []auth.UsageProviderReport{}
+	if s.handlers != nil && s.handlers.AuthManager != nil {
+		providers = s.handlers.AuthManager.UsageReport(now)
+	}
+	c.JSON(http.StatusOK, gin.H{"generated_at": now.UTC(), "providers": providers})
 }
